@@ -1,0 +1,351 @@
+#!/bin/sh
+# =====================================================================
+# Passwall2 + Iran Traffic Split (Optimized for OpenWrt 25.12 - APK)
+# =====================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()  { echo -e "${YELLOW}[*] $1${NC}"; }
+log_repo()  { echo -e "${BLUE} $1${NC}"; }
+log_ok()    { echo -e "${GREEN}[OK] $1${NC}"; }
+log_fail()  { echo -e "${RED}[X] $1${NC}"; exit 1; }
+
+clear
+echo ""
+echo ""
+log_repo "╔════════════════════════════════════════════════════════════════════╗"
+log_repo "║                                                                    ║"
+log_repo "║    Starting PassWall2 installation and Iranian traffic routing...  ║"
+log_repo "║                         (OpenWrt 25.12 APK)                        ║"
+log_repo "║                                                                    ║"
+log_repo "╚════════════════════════════════════════════════════════════════════╝"
+echo ""
+echo ""
+
+# ———————— تست اینترنت مخصوص ایران ————————
+check_internet_iran() {
+    log_info "Internet check..."
+
+    if ! ping -4 -c 3 -W 6 8.8.8.8 >/dev/null 2>&1; then
+        log_fail "No connectivity – ping failed"
+    else
+        log_ok "Ping test to 8.8.8.8 succeeded"
+    fi
+
+    SUCCESS=0
+    echo ""
+    log_info "Iran-friendly internet check (CDN + HTTPS)..."
+    wget --timeout=10 -q --spider https://www.google.com 2>/dev/null && SUCCESS=1
+    wget --timeout=10 -q --spider https://openwrt.org 2>/dev/null && SUCCESS=1
+    wget --timeout=10 -q --spider https://www.cloudflare.com 2>/dev/null && SUCCESS=1
+
+    if [ $SUCCESS -eq 1 ]; then
+        log_ok "HTTPS check passed"
+    else
+        log_info "HTTPS check failed for all tested sites, but ping is OK. Continuing..."
+    fi
+
+    return 0
+}
+
+if ! check_internet_iran; then
+    echo
+    log_fail "Installation stopped – fix internet first"
+    exit 1
+fi
+
+# 1. Update package lists (APK)
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Updating APK package lists..."
+apk update >/dev/null 2>&1 || {
+    killall apk 2>/dev/null
+    rm -f /lib/apk/db/lock /etc/apk/lock 2>/dev/null
+    apk update >/dev/null 2>&1 || log_fail "Failed to run 'apk update' – check internet connection"
+}
+
+# 2. Install/Replace dnsmasq → dnsmasq-full
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Installing dnsmasq-full and required kernel modules..."
+apk del dnsmasq >/dev/null 2>&1
+apk add dnsmasq-full kmod-nft-tproxy kmod-nft-socket tcpdump >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_ok "dnsmasq-full + nft modules installed"
+else
+    log_fail "Failed to install dnsmasq-full or nft modules"
+fi
+
+# 3. Add official PassWall2 feeds for APK
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Adding official PassWall2 APK feeds..."
+mkdir -p /etc/apk/keys /etc/apk/repositories.d
+
+# Download and install public key for apk
+wget -q -O /etc/apk/keys/passwall.pub https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub
+
+release=$( . /etc/openwrt_release ; echo ${DISTRIB_RELEASE%.*} )
+arch=$( . /etc/openwrt_release ; echo $DISTRIB_ARCH )
+
+cat << EOF > /etc/apk/repositories.d/passwall.list
+https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$release/$arch/passwall_packages
+https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$release/$arch/passwall2
+EOF
+
+apk update >/dev/null 2>&1
+
+# 4. Install PassWall2 and geo files using APK
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Installing luci-app-passwall2 + geo databases..."
+apk add luci-app-passwall2 v2ray-geosite-ir v2ray-geoip >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    log_ok "luci-app-passwall2 and geo files installed successfully"
+else
+    log_fail "Failed to install PassWall2 packages – check internet or feeds"
+fi
+
+# 5. System settings (timezone + DNS)
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Applying system settings (Tehran timezone + no ISP DNS)..."
+uci set system.@system[0].zonename='Asia/Tehran' 2>/dev/null
+uci set system.@system[0].timezone='<+0330>-3:30' 2>/dev/null
+uci set network.wan.peerdns='0' 2>/dev/null
+uci set network.wan6.peerdns='0' 2>/dev/null
+uci set network.wan6.dns='2001:4860:4860::8888' 2>/dev/null
+uci commit system >/dev/null 2>&1
+uci commit network >/dev/null 2>&1
+log_ok "System settings applied"
+
+# 6. Global PassWall2 settings
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Configuring PassWall2 global rules..."
+uci -q delete passwall2.@global_forwarding[0]
+uci add passwall2 global_forwarding
+uci set passwall2.@global_forwarding[-1].tcp_no_redir_ports='disable'
+uci set passwall2.@global_forwarding[-1].udp_no_redir_ports='disable'
+uci set passwall2.@global_forwarding[-1].tcp_redir_ports='1:65535'
+uci set passwall2.@global_forwarding[-1].udp_redir_ports='1:65535'
+uci set passwall2.@global[0].remote_dns='8.8.4.4'
+log_ok "Global forwarding configured"
+
+# 7. Remove default rules
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Removing default unnecessary rules..."
+for r in ProxyGame GooglePlay Netflix OpenAI Proxy China QUIC UDP; do
+    uci -q delete passwall2.$r
+done
+log_ok "Default rules removed"
+
+### 8. IRAN direct rules
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Adding IRAN Geo (ip/site) direct rules..."
+
+uci set passwall2.Direct=shunt_rules
+uci set passwall2.Direct.network='tcp,udp'
+uci set passwall2.Direct.remarks='IRAN Geo'
+uci set passwall2.Direct.ip_list='geoip:ir
+0.0.0.0/8
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.0.0.0/24
+192.0.2.0/24
+192.88.99.0/24
+192.168.0.0/16
+198.19.0.0/16
+198.51.100.0/24
+203.0.113.0/24
+224.0.0.0/4
+240.0.0.0/4
+255.255.255.255/32
+::/128
+::1/128
+::ffff:0:0:0/96
+64:ff9b::/96
+100::/64
+2001::/32
+2001:20::/28
+2001:db8::/32
+2002::/16
+fc00::/7
+fe80::/10
+ff00::/8'
+
+uci set passwall2.Direct.domain_list='regexp:^.+\.ir$
+geosite:category-ir'
+
+log_ok "IRAN Geo (IP/site) direct rules have been set..."
+
+### 9. International direct rule
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Adding International Public (ip/site) direct rules..."
+
+uci set passwall2.DirectGame=shunt_rules
+uci set passwall2.DirectGame.network='tcp,udp'
+uci set passwall2.DirectGame.remarks='International-Direct'
+uci set passwall2.DirectGame.ip_list=''
+uci set passwall2.DirectGame.domain_list='epicgames.com
+capcut.com
+adobe.com
+ubisoft.com
+google.com
+bingx.com
+openwrt.org
+twitch.tv
+byteoversea.com
+xbox.com
+fcdn.co
+adobe.io
+cloudflare.com
+playstation.com
+tradingview.com
+reachthefinals.com
+midi-mixer.com
+google-analytics.com
+cloudflare-dns.com
+activision.com
+biostar.com.tw
+aternos.me
+geforce.com
+gvt1.com
+ubi.com
+ea.com
+eapressportal.com
+myaccount.ea.com
+origin.com
+epicgames.dev
+rockstargames.com
+rockstarnorth.com
+googlevideo.com
+2ip.io
+safepal.com
+microsoft.com
+apps.microsoft.com
+live.com
+ytimg.com
+t.me
+whatsapp.com
+reddit.com
+pvp.net
+discord.com
+discord.gg
+discordapp.net
+discordapp.com
+bing.com
+discord.media
+approved-proxy.bc.ubisoft.com
+tlauncher.org
+aternos.host
+aternos.me
+aternos.org
+aternos.net
+aternos.com
+steamcommunity.com
+steam.com
+steampowered.com
+steamstatic.com'
+
+uci set passwall2.myshunt.Direct='_direct'
+uci set passwall2.myshunt.DirectGame='_direct'
+uci delete passwall2.myshunt 2>/dev/null
+
+log_ok "International public (IP/site) direct rules have been set..."
+
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Updating Shunt..."
+
+### 11. MainShunt
+uci set passwall2.MainShunt=nodes
+uci set passwall2.MainShunt.remarks='MainShunt'
+uci set passwall2.MainShunt.type='Xray'
+uci set passwall2.MainShunt.protocol='_shunt'
+uci set passwall2.MainShunt.Direct='_direct'
+uci set passwall2.MainShunt.DirectGame='_default'
+
+### 12. PC-Shunt
+uci set passwall2.PC_Shunt=nodes
+uci set passwall2.PC_Shunt.remarks='PC-Shunt'
+uci set passwall2.PC_Shunt.type='Xray'
+uci set passwall2.PC_Shunt.protocol='_shunt'
+uci set passwall2.PC_Shunt.Direct='_direct'
+uci set passwall2.PC_Shunt.DirectGame='_default'
+
+uci commit passwall2
+uci commit system
+
+### 13. Rebind Domain
+uci set dhcp.@dnsmasq[0].rebind_domain='www.ebanksepah.ir 
+my.irancell.ir'
+uci commit dhcp
+
+log_ok "Rebind domains configured..."
+
+# 14. Download banner
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Download Passwall2 Banner..."
+FILE_URL="https://raw.githubusercontent.com/saeed9400/IRAN_Passwall2/refs/heads/main/data/status_v1.htm"
+DEST_DIR="/usr/lib/lua/luci/view/passwall2/global"
+DEST_FILE="$DEST_DIR/status.htm"
+
+[ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR"
+
+if [ -f "$DEST_FILE" ]; then
+    BACKUP_FILE="$DEST_FILE.bak_$(date +%Y-%m-%d_%H-%M-%S)"
+    mv "$DEST_FILE" "$BACKUP_FILE"
+    echo "Backup created: $BACKUP_FILE"
+fi
+
+wget -q -O "$DEST_FILE" "$FILE_URL"
+
+if [ $? -eq 0 ]; then
+    log_ok "File downloaded and saved to: $DEST_FILE"
+else
+    log_fail "Download failed!"
+fi
+
+# 15. Final commit & restart
+echo ""
+log_repo "---------------------------------------------------------------"
+echo ""
+log_info "Saving configuration and restarting service..."
+uci -q delete passwall2.myshunt 2>/dev/null
+uci commit passwall2 >/dev/null 2>&1
+/etc/init.d/passwall2 restart >/dev/null 2>&1
+/sbin/reload_config >/dev/null 2>&1
+log_ok "Configuration saved and service restarted"
+
+echo ""
+echo ""
+log_repo "╔═════════════════════════════════════════════════════════════════╗"
+log_repo "║                                                                 ║"
+log_repo "║        PassWall2 installed and configured successfully!         ║"
+log_repo "║                                                                 ║"
+log_repo "╚═════════════════════════════════════════════════════════════════╝"
+echo ""
+echo ""
